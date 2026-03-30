@@ -1,6 +1,8 @@
-# 🐱 FloppyMoo
+# 🐱 Floppy Moo
 
-A dark, moody browser-based Flappy Bird-style game starring **Moo** — a grey cat navigating a midnight world of pipes, seafood, and power-ups.
+This game is dedicated to my senior grey cat named Moo! 
+
+It's a dark, moody browser-based Flappy Bird-style game starring **Moo** — a grey cat navigating a midnight world of pipes, seafood, and power-ups.
 
 Built as a single self-contained HTML file. No dependencies, no build step.
 

@@ -59,6 +59,7 @@ const PAL = {
   catEye:'#e8e060', catNose:'#e08080', catPupil:'#1a1a1a',
   ui:'#c8c8e0', uiDim:'#606080', flash:'#ffffff',
   heart:'#e85580', shield:'#60c8ff', wings:'#f0d060',
+  magnet:'#ff6666', magnify:'#66ddff',
 };
 
 let activeCanvas = document.getElementById('c');
@@ -72,11 +73,14 @@ let shieldActive = false, shieldTimer = 0;
 let wingsActive = false, wingsTimer = 0;
 let seafoodDoubler = false, seafoodDoublerTimer = 0;
 let slowmo = false, slowmoTimer = 0;
+let magnetActive = false, magnetTimer = 0;
+let magnifyActive = false, magnifyTimer = 0;
 let countdownVal = 3, countdownFrames = 0;
 let speedMult = 1;
 let hitFlashTimer = 0;
 let nextPipeIn = 0, pipeCount = 0;
 let keys = {};
+let touchCanvasY = null;
 
 // Popup notification for seafood
 let popup = null; // { text, color, timer, x, y }
@@ -86,8 +90,10 @@ const BASE_SPEED = 1.8, GROUND_H = 50, BASE_INTERVAL = 110;
 const SHIELD_DURATION = 600;  // 10s @ 60fps
 const WINGS_DURATION  = 600;  // 10s @ 60fps
 const WINGS_WARN      = 120;  // 2s warning
-const FIRST_PIPE_DELAY = 120; // ~2s after GO (was 300 = 5s, cut 3s)
+const FIRST_PIPE_DELAY = 120; // ~2s after GO
 const WINGS_SPEED = 3.5;
+const MAGNET_DURATION  = 600; // 10s @ 60fps
+const MAGNIFY_DURATION = 600; // 10s @ 60fps
 
 // ── Key tracking ───────────────────────────────────────────────────────────────
 document.addEventListener('keydown', e => {
@@ -213,6 +219,28 @@ function playSeafoodCollect() {
   });
 }
 
+function playMagnetCollect() {
+  ensureAudio(); if (!actx) return;
+  const t=actx.currentTime;
+  const o=actx.createOscillator(), g=actx.createGain();
+  o.connect(g); g.connect(actx.destination); o.type='sawtooth';
+  o.frequency.setValueAtTime(1200,t); o.frequency.exponentialRampToValueAtTime(300,t+0.3);
+  g.gain.setValueAtTime(0.13,t); g.gain.exponentialRampToValueAtTime(0.001,t+0.35);
+  o.start(t); o.stop(t+0.38);
+}
+
+function playMagnifyCollect() {
+  ensureAudio(); if (!actx) return;
+  const t=actx.currentTime;
+  [[0,400],[0.08,650],[0.18,1000],[0.3,1500]].forEach(([d,f])=>{
+    const o=actx.createOscillator(), g=actx.createGain();
+    o.connect(g); g.connect(actx.destination); o.type='sine';
+    o.frequency.setValueAtTime(f,t+d);
+    g.gain.setValueAtTime(0.13,t+d); g.gain.exponentialRampToValueAtTime(0.001,t+d+0.2);
+    o.start(t+d); o.stop(t+d+0.22);
+  });
+}
+
 function playBeep(freq) {
   ensureAudio(); if (!actx) return;
   const t=actx.currentTime;
@@ -260,9 +288,12 @@ function resetGame() {
   wingsActive=false; wingsTimer=0;
   seafoodDoubler=false; seafoodDoublerTimer=0;
   slowmo=false; slowmoTimer=0;
+  magnetActive=false; magnetTimer=0;
+  magnifyActive=false; magnifyTimer=0;
   speedMult=1; pipeCount=0; popup=null;
   nextPipeIn=FIRST_PIPE_DELAY;
   updateScoreUI();
+  updateBestUI();
   showPauseBtn(false);
   updatePauseBtn();
 }
@@ -276,7 +307,9 @@ function startCountdown() {
 // ── Pipe interval ──────────────────────────────────────────────────────────────
 function getNextInterval() {
   pipeCount++;
-  const base=Math.round(BASE_INTERVAL/speedMult);
+  // After 1000 pts add extra spacing so the faster speed doesn't crowd pipes
+  const extraGap = score >= 1000 ? 30 : 0;
+  const base=Math.round((BASE_INTERVAL + extraGap)/speedMult);
   if(pipeCount%4===0||pipeCount%5===0) return base;
   return Math.round(base*(0.7+Math.random()*1.6));
 }
@@ -299,7 +332,39 @@ function jump() {
 }
 document.getElementById('c').addEventListener('click', jump);
 document.getElementById('fs-canvas').addEventListener('click', jump);
-document.addEventListener('touchstart', e=>{ e.preventDefault(); jump(); },{passive:false});
+
+// ── Touch controls (mobile) ────────────────────────────────────────────────────
+function getCanvasY(clientY, canvas) {
+  const rect = canvas.getBoundingClientRect();
+  return (clientY - rect.top) * (H / rect.height);
+}
+
+function onTouchStart(e) {
+  e.preventDefault();
+  if(e.touches.length > 0) {
+    touchCanvasY = getCanvasY(e.touches[0].clientY, e.currentTarget);
+  }
+  if(!wingsActive) jump();
+}
+function onTouchMove(e) {
+  e.preventDefault();
+  if(e.touches.length > 0) {
+    touchCanvasY = getCanvasY(e.touches[0].clientY, e.currentTarget);
+  }
+}
+function onTouchEnd(e) {
+  e.preventDefault();
+  touchCanvasY = null;
+}
+
+const mainCanvas = document.getElementById('c');
+const fsCanvas   = document.getElementById('fs-canvas');
+mainCanvas.addEventListener('touchstart', onTouchStart, {passive:false});
+mainCanvas.addEventListener('touchmove',  onTouchMove,  {passive:false});
+mainCanvas.addEventListener('touchend',   onTouchEnd,   {passive:false});
+fsCanvas.addEventListener('touchstart', onTouchStart, {passive:false});
+fsCanvas.addEventListener('touchmove',  onTouchMove,  {passive:false});
+fsCanvas.addEventListener('touchend',   onTouchEnd,   {passive:false});
 
 // ── Seafood types ──────────────────────────────────────────────────────────────
 const SEAFOOD_TYPES = ['fish','shrimp','crab','lobster'];
@@ -313,10 +378,12 @@ const SEAFOOD_INFO = {
 
 function spawnSeafood(x) {
   const gh=S(GROUND_H), minY=S(55), maxY=H-gh-S(40);
+  // Only offer crab (slow-mo) once player has hit 500 points
+  const pool = score >= 500 ? SEAFOOD_TYPES : SEAFOOD_TYPES.filter(t => t !== 'crab');
   return {
     x,
     y: minY+Math.random()*(maxY-minY),
-    type: SEAFOOD_TYPES[Math.floor(Math.random()*SEAFOOD_TYPES.length)],
+    type: pool[Math.floor(Math.random()*pool.length)],
     pulse: Math.random()*Math.PI*2,
     bobOffset: Math.random()*Math.PI*2,
   };
@@ -343,7 +410,6 @@ function drawBackground() {
   drawStars(); drawMoon();
 }
 function drawGround() {
-  // Ground scrolls with world speed (slowed if slowmo), not cat speed
   const gh=S(GROUND_H), spd=BASE_SPEED*speedMult*(W/420)*(slowmo?0.3:1);
   ctx.fillStyle=PAL.ground; ctx.fillRect(0,H-gh,W,gh);
   ctx.fillStyle=PAL.groundTop; ctx.fillRect(0,H-gh,W,S(5));
@@ -415,6 +481,47 @@ function drawWingsIcon(x,y,size,alpha) {
     ctx.beginPath(); ctx.moveTo(x,y); ctx.lineTo(x+dx*s,y+dy*s); ctx.stroke();
     ctx.beginPath(); ctx.moveTo(x,y); ctx.lineTo(x-dx*s,y+dy*s); ctx.stroke();
   });
+  ctx.restore();
+}
+
+function drawMagnetIcon(x,y,size,alpha) {
+  ctx.save(); ctx.globalAlpha=alpha;
+  const s=size;
+  // Glow
+  const gr=ctx.createRadialGradient(x,y,0,x,y,s*1.5);
+  gr.addColorStop(0,'rgba(255,100,100,0.35)'); gr.addColorStop(1,'rgba(255,100,100,0)');
+  ctx.fillStyle=gr; ctx.beginPath(); ctx.arc(x,y,s*1.5,0,Math.PI*2); ctx.fill();
+  // Horseshoe arc
+  ctx.strokeStyle=PAL.magnet; ctx.lineWidth=s*0.38; ctx.lineCap='round';
+  ctx.beginPath(); ctx.arc(x,y+s*0.15,s*0.62,Math.PI,0,false); ctx.stroke();
+  // Left leg
+  ctx.beginPath(); ctx.moveTo(x-s*0.62,y+s*0.15); ctx.lineTo(x-s*0.62,y+s*0.72); ctx.stroke();
+  // Right leg
+  ctx.beginPath(); ctx.moveTo(x+s*0.62,y+s*0.15); ctx.lineTo(x+s*0.62,y+s*0.72); ctx.stroke();
+  // Silver tips
+  ctx.strokeStyle='#dddddd'; ctx.lineWidth=s*0.38;
+  ctx.beginPath(); ctx.moveTo(x-s*0.62,y+s*0.5); ctx.lineTo(x-s*0.62,y+s*0.78); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(x+s*0.62,y+s*0.5); ctx.lineTo(x+s*0.62,y+s*0.78); ctx.stroke();
+  ctx.restore();
+}
+
+function drawMagnifyIcon(x,y,size,alpha) {
+  ctx.save(); ctx.globalAlpha=alpha;
+  const s=size;
+  // Glow
+  const gr=ctx.createRadialGradient(x,y,0,x,y,s*1.5);
+  gr.addColorStop(0,'rgba(100,220,255,0.35)'); gr.addColorStop(1,'rgba(100,220,255,0)');
+  ctx.fillStyle=gr; ctx.beginPath(); ctx.arc(x,y,s*1.5,0,Math.PI*2); ctx.fill();
+  // Lens circle
+  ctx.strokeStyle=PAL.magnify; ctx.lineWidth=s*0.22;
+  ctx.beginPath(); ctx.arc(x-s*0.1,y-s*0.1,s*0.62,0,Math.PI*2); ctx.stroke();
+  // Handle
+  ctx.strokeStyle='#88bbdd'; ctx.lineWidth=s*0.26; ctx.lineCap='round';
+  ctx.beginPath(); ctx.moveTo(x+s*0.33,y+s*0.33); ctx.lineTo(x+s*0.82,y+s*0.82); ctx.stroke();
+  // Plus sign inside lens
+  ctx.strokeStyle=PAL.magnify; ctx.lineWidth=s*0.16;
+  ctx.beginPath(); ctx.moveTo(x-s*0.1,y-s*0.52); ctx.lineTo(x-s*0.1,y+s*0.32); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(x-s*0.52,y-s*0.1); ctx.lineTo(x+s*0.32,y-s*0.1); ctx.stroke();
   ctx.restore();
 }
 
@@ -507,8 +614,8 @@ function drawLobster(x,y,s,alpha) {
   ctx.restore();
 }
 
-function drawSeafoodItem(c) {
-  const s=S(13);
+function drawSeafoodItem(c, magnifyScale) {
+  const s=S(13)*magnifyScale;
   const bob=Math.sin(frame*0.07+c.bobOffset)*S(3);
   const y=c.y+bob;
   const pulse=1+0.08*Math.sin(c.pulse);
@@ -523,7 +630,7 @@ function drawSeafoodItem(c) {
   if(c.type==='shrimp')  drawShrimp(c.x,y,s*pulse,0.95);
   if(c.type==='crab')    drawCrab(c.x,y,s*pulse,0.95);
   if(c.type==='lobster') drawLobster(c.x,y,s*pulse,0.95);
-  // label under the item
+  // label under the item (label stays same size regardless of magnify)
   ctx.save();
   ctx.font='500 '+Math.round(S(8))+'px monospace';
   ctx.textAlign='center'; ctx.fillStyle=info.color; ctx.globalAlpha=0.75;
@@ -532,20 +639,27 @@ function drawSeafoodItem(c) {
 }
 
 function drawCollectibles() {
+  const msc = magnifyActive ? 3 : 1;
   for(const c of collectibles){
     c.pulse=(c.pulse||0)+0.08;
     if(c.type==='heart'){
-      const sc=1+0.1*Math.sin(c.pulse);
+      const sc=msc*(1+0.1*Math.sin(c.pulse));
       drawHeart(c.x,c.y,S(10)*sc,0.92);
     } else if(c.type==='shield'){
-      const sc=1+0.07*Math.sin(c.pulse);
+      const sc=msc*(1+0.07*Math.sin(c.pulse));
       drawShieldIcon(c.x,c.y,S(10)*sc,0.88+0.08*Math.sin(c.pulse));
     } else if(c.type==='wings'){
-      const sc=1+0.09*Math.sin(c.pulse);
+      const sc=msc*(1+0.09*Math.sin(c.pulse));
       drawWingsIcon(c.x,c.y,S(11)*sc,0.9+0.07*Math.sin(c.pulse));
+    } else if(c.type==='magnet'){
+      const sc=msc*(1+0.08*Math.sin(c.pulse));
+      drawMagnetIcon(c.x,c.y,S(11)*sc,0.88+0.08*Math.sin(c.pulse));
+    } else if(c.type==='magnify'){
+      const sc=msc*(1+0.08*Math.sin(c.pulse));
+      drawMagnifyIcon(c.x,c.y,S(11)*sc,0.88+0.08*Math.sin(c.pulse));
     } else {
       c.bobOffset=c.bobOffset||0;
-      drawSeafoodItem(c);
+      drawSeafoodItem(c, msc);
     }
   }
 }
@@ -592,6 +706,22 @@ function drawHUD() {
     ctx.fillText('slow '+secs+'s',rightX,rowY+S(4)); ctx.globalAlpha=1; rowY+=S(18);
   }
 
+  if(magnetActive && magnetTimer>0){
+    const secs=Math.ceil(magnetTimer/60);
+    drawMagnetIcon(W-S(36),rowY,S(8),0.9);
+    ctx.font='600 '+Math.round(S(10))+'px monospace';
+    ctx.textAlign='right'; ctx.fillStyle=PAL.magnet; ctx.globalAlpha=0.88;
+    ctx.fillText(secs+'s',rightX,rowY+S(4)); ctx.globalAlpha=1; rowY+=S(22);
+  }
+
+  if(magnifyActive && magnifyTimer>0){
+    const secs=Math.ceil(magnifyTimer/60);
+    drawMagnifyIcon(W-S(36),rowY,S(8),0.9);
+    ctx.font='600 '+Math.round(S(10))+'px monospace';
+    ctx.textAlign='right'; ctx.fillStyle=PAL.magnify; ctx.globalAlpha=0.88;
+    ctx.fillText('3x '+secs+'s',rightX,rowY+S(4)); ctx.globalAlpha=1; rowY+=S(22);
+  }
+
   ctx.textAlign='left';
 
   // Wings fading warning
@@ -604,10 +734,24 @@ function drawHUD() {
     ctx.restore();
   }
 
-  // Slowmo tint (world slows but NOT Moo — tint is faint)
+  // Slowmo tint
   if(slowmo){
     ctx.save(); ctx.globalAlpha=0.08;
     ctx.fillStyle='#80d8ff'; ctx.fillRect(0,0,W,H);
+    ctx.restore();
+  }
+
+  // Magnify tint
+  if(magnifyActive){
+    ctx.save(); ctx.globalAlpha=0.06;
+    ctx.fillStyle=PAL.magnify; ctx.fillRect(0,0,W,H);
+    ctx.restore();
+  }
+
+  // Magnet field effect (subtle)
+  if(magnetActive){
+    ctx.save(); ctx.globalAlpha=0.06+0.03*Math.sin(frame*0.18);
+    ctx.fillStyle=PAL.magnet; ctx.fillRect(0,0,W,H);
     ctx.restore();
   }
 
@@ -627,10 +771,8 @@ function drawHUD() {
     ctx.globalAlpha=alpha;
     ctx.font='700 '+Math.round(S(13))+'px monospace';
     ctx.textAlign='center';
-    // shadow
     ctx.fillStyle='rgba(0,0,0,0.5)';
     ctx.fillText(popup.text, popup.x+S(1), popup.y-rise+S(1));
-    // text
     ctx.fillStyle=popup.color;
     ctx.fillText(popup.text, popup.x, popup.y-rise);
     ctx.restore();
@@ -821,20 +963,22 @@ function update() {
   // ── Slowmo: world (pipes, collectibles, ground) slows to 30%.
   //    Moo's gravity & jump are FULL speed — only world moves slowly.
   const worldSlow = slowmo ? 0.3 : 1;
-  const g = GRAVITY*(H/460);                            // Moo = always full gravity
-  const spd = BASE_SPEED*speedMult*(W/420)*worldSlow;   // world = slowed
+  const g = GRAVITY*(H/460);
+  const spd = BASE_SPEED*speedMult*(W/420)*worldSlow;
 
   // ── Wings mode ────────────────────────────────────────────────────────────
   if(wingsActive){
     cat.vy=0; cat.angle=0;
-    // Wings: Moo moves at full speed in either direction
-    if(keys['ArrowUp'])   cat.y=Math.max(cat.y-WINGS_SPEED, S(16));
-    if(keys['ArrowDown']) cat.y=Math.min(cat.y+WINGS_SPEED, H-S(GROUND_H)-S(16));
+    // Wings: keyboard ArrowUp/Down or mobile touch (above/below Moo)
+    const goUp   = keys['ArrowUp']   || (touchCanvasY !== null && touchCanvasY < cat.y - S(8));
+    const goDown = keys['ArrowDown'] || (touchCanvasY !== null && touchCanvasY > cat.y + S(8));
+    if(goUp)   cat.y=Math.max(cat.y-WINGS_SPEED, S(16));
+    if(goDown) cat.y=Math.min(cat.y+WINGS_SPEED, H-S(GROUND_H)-S(16));
     wingsTimer--;
     if(wingsTimer<=0){ wingsActive=false; wingsTimer=0; }
   } else {
     // ── Normal physics ───────────────────────────────────────────────────
-    cat.vy+=g; cat.y+=cat.vy;                           // full speed for Moo
+    cat.vy+=g; cat.y+=cat.vy;
     cat.angle=Math.min(Math.max(cat.vy*0.06,-0.5),1.1);
     if(cat.invincible>0) cat.invincible--;
   }
@@ -847,6 +991,8 @@ function update() {
   if(shieldActive){ shieldTimer--; if(shieldTimer<=0){ shieldActive=false; shieldTimer=0; } }
   if(seafoodDoubler){ seafoodDoublerTimer--; if(seafoodDoublerTimer<=0){ seafoodDoubler=false; } }
   if(slowmo){ slowmoTimer--; if(slowmoTimer<=0){ slowmo=false; slowmoTimer=0; } }
+  if(magnetActive){ magnetTimer--; if(magnetTimer<=0){ magnetActive=false; magnetTimer=0; } }
+  if(magnifyActive){ magnifyTimer--; if(magnifyTimer<=0){ magnifyActive=false; magnifyTimer=0; } }
 
   // Pipe spawn (countdown runs at real time)
   nextPipeIn--;
@@ -855,14 +1001,16 @@ function update() {
     const topH=minTop+Math.random()*(maxTop-minTop);
     pipes.push({x:W+10,topH,scored:false});
 
-    if(Math.random()<0.30){
+    if(Math.random() < 0.30){
       const cy=topH+gap/2+(Math.random()-0.5)*gap*0.28;
       const roll=Math.random();
       let type;
-      if(roll<0.06) type='wings';
-      else if(roll<0.16) type='shield';
-      else if(hearts<5) type='heart';
-      else type='shield';
+      if(roll<0.04)       type='wings';
+      else if(roll<0.19)  type='magnet';
+      else if(roll<0.34)  type='magnify';
+      else if(roll<0.65)  type='shield';
+      else if(hearts<5)   type='heart';
+      else                type='shield';
       collectibles.push({x:W+10+S(PIPE_W)*0.5, y:cy, type, pulse:Math.random()*Math.PI*2});
     }
 
@@ -880,38 +1028,70 @@ function update() {
   collectibles.forEach(c=>c.x-=spd);
   collectibles=collectibles.filter(c=>c.x+S(20)>-10);
 
-  // Score
-  for(const p of pipes){
-    if(!p.scored && p.x+S(PIPE_W)<cat.x){
-      p.scored=true;
-      score+=(seafoodDoubler?2:1); updateScoreUI();
+  // Magnet: attract all collectibles toward Moo
+  if(magnetActive){
+    collectibles.forEach(c=>{
+      const dx=cat.x-c.x, dy=cat.y-c.y;
+      const dist=Math.sqrt(dx*dx+dy*dy);
+      if(dist>S(5)){
+        const pull=Math.min(6, dist*0.06+1);
+        c.x+=(dx/dist)*pull;
+        c.y+=(dy/dist)*pull;
+      }
+    });
+  }
+
+  // Score — only while Moo is alive (prevents post-death score drift)
+  if(!cat.dead){
+    for(const p of pipes){
+      if(!p.scored && p.x+S(PIPE_W)<cat.x){
+        p.scored=true;
+        score+=(seafoodDoubler?2:1); updateScoreUI();
+      }
     }
   }
 
   // Collect items
   if(!cat.dead){
+    const collectRadius = magnifyActive ? S(32) : S(18);
     collectibles=collectibles.filter(c=>{
       const dx=c.x-cat.x, dy=c.y-cat.y;
-      if(Math.sqrt(dx*dx+dy*dy)<S(18)){
-        const info=SEAFOOD_INFO[c.type];
+      if(Math.sqrt(dx*dx+dy*dy)<collectRadius){
         if(c.type==='heart'){
           if(hearts<5){ hearts++; playHeartCollect(); showPopup('+1 heart!','#e85580',cat.x,cat.y-S(25)); }
         } else if(c.type==='shield'){
-          shieldActive=true; shieldTimer=SHIELD_DURATION; playShieldCollect();
-          showPopup('shield on!',PAL.shield,cat.x,cat.y-S(25));
+          if(shieldActive){
+            // Already shielded: only add 3 seconds instead of full 10
+            shieldTimer=Math.min(shieldTimer+180, SHIELD_DURATION);
+            playShieldCollect();
+            showPopup('+3s shield!',PAL.shield,cat.x,cat.y-S(25));
+          } else {
+            shieldActive=true; shieldTimer=SHIELD_DURATION; playShieldCollect();
+            showPopup('shield on!',PAL.shield,cat.x,cat.y-S(25));
+          }
         } else if(c.type==='wings'){
           wingsActive=true; wingsTimer=WINGS_DURATION; playWingsCollect();
           showPopup('fly free! ↑↓',PAL.wings,cat.x,cat.y-S(25));
+        } else if(c.type==='magnet'){
+          magnetActive=true; magnetTimer=MAGNET_DURATION; playMagnetCollect();
+          showPopup('magnet!',PAL.magnet,cat.x,cat.y-S(25));
+        } else if(c.type==='magnify'){
+          magnifyActive=true; magnifyTimer=MAGNIFY_DURATION; playMagnifyCollect();
+          showPopup('3x size!',PAL.magnify,cat.x,cat.y-S(25));
         } else if(c.type==='fish'){
+          const info=SEAFOOD_INFO[c.type];
           seafoodDoubler=true; seafoodDoublerTimer=900; playSeafoodCollect();
           showPopup(info.label,info.color,cat.x,cat.y-S(25));
         } else if(c.type==='shrimp'){
+          const info=SEAFOOD_INFO[c.type];
           hearts=Math.min(hearts+1,5); playSeafoodCollect();
           showPopup(info.label,info.color,cat.x,cat.y-S(25));
         } else if(c.type==='crab'){
+          const info=SEAFOOD_INFO[c.type];
           slowmo=true; slowmoTimer=480; playSeafoodCollect();
           showPopup(info.label,info.color,cat.x,cat.y-S(25));
         } else if(c.type==='lobster'){
+          const info=SEAFOOD_INFO[c.type];
           score+=5; updateScoreUI(); playSeafoodCollect();
           showPopup(info.label,info.color,cat.x,cat.y-S(25));
         }
@@ -932,7 +1112,6 @@ function update() {
       setTimeout(()=>{ state='dead'; },600);
     } else if(hit==='pipe' && !isImmuneViaPower && cat.invincible<=0){
       if(shieldActive){
-        // Shield: stays active, no hearts lost, just bounce + flash
         cat.invincible=60; hitFlashTimer=10;
         cat.vy=JUMP*(H/460)*0.4;
         playOww();

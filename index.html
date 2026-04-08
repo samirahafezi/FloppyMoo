@@ -82,18 +82,29 @@ let nextPipeIn = 0, pipeCount = 0;
 let keys = {};
 let touchCanvasY = null;
 
-// Popup notification for seafood
-let popup = null; // { text, color, timer, x, y }
+// Popup notification
+let popup = null;
 
-const GRAVITY = 0.35, JUMP = -7.5, PIPE_W = 52, GAP = 185;
+// Pipe challenge state
+let lastPipeHigh = null;    // for high/low alternation
+let pendingDoublePipe = false; // schedule a close follow-up pipe
+let nextPipeIsNarrow = false;  // wide → narrow rhythm
+let lastHitPipe = null;        // which pipe was last hit (for shatter)
+
+// Particle systems
+let shatterParticles = []; // pipe shatter on shield hit
+let nearMissSparks = [];   // sparks on near-miss pass
+
+const GRAVITY = 0.35, JUMP = -7.5, PIPE_W = 52;
 const BASE_SPEED = 1.8, GROUND_H = 50, BASE_INTERVAL = 110;
-const SHIELD_DURATION = 600;  // 10s @ 60fps
-const WINGS_DURATION  = 600;  // 10s @ 60fps
-const WINGS_WARN      = 120;  // 2s warning
-const FIRST_PIPE_DELAY = 120; // ~2s after GO
+const MIN_GAP = 130, MAX_GAP = 185;
+const SHIELD_DURATION = 600;
+const WINGS_DURATION  = 600;
+const WINGS_WARN      = 120;
+const FIRST_PIPE_DELAY = 120;
 const WINGS_SPEED = 3.5;
-const MAGNET_DURATION  = 600; // 10s @ 60fps
-const MAGNIFY_DURATION = 600; // 10s @ 60fps
+const MAGNET_DURATION  = 600;
+const MAGNIFY_DURATION = 900;
 
 // ── Key tracking ───────────────────────────────────────────────────────────────
 document.addEventListener('keydown', e => {
@@ -107,12 +118,9 @@ document.addEventListener('keyup', e => { keys[e.code] = false; });
 // ── Pause / resume ─────────────────────────────────────────────────────────────
 function togglePause() {
   if (state === 'playing') {
-    stateBeforePause = 'playing';
-    state = 'paused';
-    updatePauseBtn();
+    stateBeforePause = 'playing'; state = 'paused'; updatePauseBtn();
   } else if (state === 'paused') {
-    state = 'playing';
-    updatePauseBtn();
+    state = 'playing'; updatePauseBtn();
   }
 }
 function updatePauseBtn() {
@@ -171,6 +179,18 @@ function playOww() {
   o2.frequency.setValueAtTime(260,t); o2.frequency.exponentialRampToValueAtTime(190,t+0.25);
   g2.gain.setValueAtTime(0,t); g2.gain.linearRampToValueAtTime(0.08,t+0.04); g2.gain.exponentialRampToValueAtTime(0.001,t+0.3);
   o2.start(t); o2.stop(t+0.32);
+}
+
+function playShatter() {
+  ensureAudio(); if (!actx) return;
+  const t=actx.currentTime;
+  [0,0.04,0.09,0.15].forEach((d,i)=>{
+    const o=actx.createOscillator(), g=actx.createGain();
+    o.connect(g); g.connect(actx.destination); o.type='sawtooth';
+    o.frequency.setValueAtTime(180-i*25,t+d); o.frequency.exponentialRampToValueAtTime(50,t+d+0.16);
+    g.gain.setValueAtTime(0.16,t+d); g.gain.exponentialRampToValueAtTime(0.001,t+d+0.2);
+    o.start(t+d); o.stop(t+d+0.22);
+  });
 }
 
 function playHeartCollect() {
@@ -279,6 +299,73 @@ function closeFS() {
 
 function S(v){ return v*(H/460); }
 
+// ── Pipe helpers ───────────────────────────────────────────────────────────────
+// Base gap (unscaled) shrinks slowly with score, floor at MIN_GAP
+function getBaseGap() {
+  return Math.max(MIN_GAP, MAX_GAP - Math.floor(score / 80) * 4);
+}
+
+// Effective pixel gap for a pipe (base + sinusoidal oscillation if active)
+function getEffectiveGap(p) {
+  return S(p.gap) + (p.gapOscillate ? Math.sin(p.gapPhase) * S(18) : 0);
+}
+
+// Hex color linear interpolation
+function lerpColor(c1, c2, t) {
+  const r1=parseInt(c1.slice(1,3),16), g1=parseInt(c1.slice(3,5),16), b1=parseInt(c1.slice(5,7),16);
+  const r2=parseInt(c2.slice(1,3),16), g2=parseInt(c2.slice(3,5),16), b2=parseInt(c2.slice(5,7),16);
+  const r=Math.round(r1+(r2-r1)*t), g=Math.round(g1+(g2-g1)*t), b=Math.round(b1+(b2-b1)*t);
+  return '#'+r.toString(16).padStart(2,'0')+g.toString(16).padStart(2,'0')+b.toString(16).padStart(2,'0');
+}
+
+// Pipe colors shift green → dark blue-purple as score climbs
+function getPipeColors() {
+  const t=Math.min(1, score/600);
+  return {
+    body:      lerpColor('#1e3a2e','#1a2040',t),
+    border:    lerpColor('#2d5a44','#283060',t),
+    highlight: lerpColor('#3a7055','#3040a0',t),
+  };
+}
+
+// Spawn near-miss sparks at position
+function spawnNearMissSparks(x, y) {
+  for(let i=0;i<12;i++){
+    const angle=Math.random()*Math.PI*2;
+    const spd=S(1.2)+Math.random()*S(2.8);
+    nearMissSparks.push({
+      x, y,
+      vx: Math.cos(angle)*spd,
+      vy: Math.sin(angle)*spd,
+      life: 35+Math.random()*25,
+      maxLife: 60,
+    });
+  }
+}
+
+// Explode a pipe into particles (shield break)
+function shatterPipe(p) {
+  const col=getPipeColors();
+  const effGap=getEffectiveGap(p);
+  for(let i=0;i<18;i++){
+    const angle=Math.random()*Math.PI*2;
+    const spd=S(1.5)+Math.random()*S(4.5);
+    const inTop=Math.random()<0.5;
+    const py=inTop
+      ? Math.random()*p.topH
+      : p.topH+effGap+Math.random()*(H-S(GROUND_H)-p.topH-effGap);
+    shatterParticles.push({
+      x: p.x+S(4)+Math.random()*S(PIPE_W-8),
+      y: Math.max(0, Math.min(py, H-S(GROUND_H)-1)),
+      vx: Math.cos(angle)*spd*(0.5+Math.random()),
+      vy: Math.sin(angle)*spd*(0.5+Math.random())-S(0.8),
+      life: 40+Math.random()*30,
+      maxLife: 70,
+      color: Math.random()<0.6 ? col.border : col.highlight,
+    });
+  }
+}
+
 // ── Reset ──────────────────────────────────────────────────────────────────────
 function resetGame() {
   cat={x:W*0.24, y:H/2-40, vy:0, angle:0, dead:false, trail:[], armAngle:0, flapTimer:0, invincible:0};
@@ -292,6 +379,8 @@ function resetGame() {
   magnifyActive=false; magnifyTimer=0;
   speedMult=1; pipeCount=0; popup=null;
   nextPipeIn=FIRST_PIPE_DELAY;
+  lastPipeHigh=null; pendingDoublePipe=false; nextPipeIsNarrow=false; lastHitPipe=null;
+  shatterParticles=[]; nearMissSparks=[];
   updateScoreUI();
   updateBestUI();
   showPauseBtn(false);
@@ -307,9 +396,15 @@ function startCountdown() {
 // ── Pipe interval ──────────────────────────────────────────────────────────────
 function getNextInterval() {
   pipeCount++;
-  // After 1000 pts add extra spacing so the faster speed doesn't crowd pipes
+  // Double pipe: return a short interval so next pipe appears close behind
+  if(pendingDoublePipe){
+    pendingDoublePipe=false;
+    return Math.max(38, Math.round(62/speedMult));
+  }
+  // Occasionally schedule a double
+  if(Math.random()<0.18 && pipeCount>3) pendingDoublePipe=true;
   const extraGap = score >= 1000 ? 30 : 0;
-  const base=Math.round((BASE_INTERVAL + extraGap)/speedMult);
+  const base=Math.round((BASE_INTERVAL+extraGap)/speedMult);
   if(pipeCount%4===0||pipeCount%5===0) return base;
   return Math.round(base*(0.7+Math.random()*1.6));
 }
@@ -335,58 +430,42 @@ document.getElementById('fs-canvas').addEventListener('click', jump);
 
 // ── Touch controls (mobile) ────────────────────────────────────────────────────
 function getCanvasY(clientY, canvas) {
-  const rect = canvas.getBoundingClientRect();
-  return (clientY - rect.top) * (H / rect.height);
+  const rect=canvas.getBoundingClientRect();
+  return (clientY-rect.top)*(H/rect.height);
 }
-
 function onTouchStart(e) {
   e.preventDefault();
-  if(e.touches.length > 0) {
-    touchCanvasY = getCanvasY(e.touches[0].clientY, e.currentTarget);
-  }
+  if(e.touches.length>0) touchCanvasY=getCanvasY(e.touches[0].clientY,e.currentTarget);
   if(!wingsActive) jump();
 }
 function onTouchMove(e) {
   e.preventDefault();
-  if(e.touches.length > 0) {
-    touchCanvasY = getCanvasY(e.touches[0].clientY, e.currentTarget);
-  }
+  if(e.touches.length>0) touchCanvasY=getCanvasY(e.touches[0].clientY,e.currentTarget);
 }
-function onTouchEnd(e) {
-  e.preventDefault();
-  touchCanvasY = null;
-}
+function onTouchEnd(e) { e.preventDefault(); touchCanvasY=null; }
 
-const mainCanvas = document.getElementById('c');
-const fsCanvas   = document.getElementById('fs-canvas');
-mainCanvas.addEventListener('touchstart', onTouchStart, {passive:false});
-mainCanvas.addEventListener('touchmove',  onTouchMove,  {passive:false});
-mainCanvas.addEventListener('touchend',   onTouchEnd,   {passive:false});
-fsCanvas.addEventListener('touchstart', onTouchStart, {passive:false});
-fsCanvas.addEventListener('touchmove',  onTouchMove,  {passive:false});
-fsCanvas.addEventListener('touchend',   onTouchEnd,   {passive:false});
+const mainCanvas=document.getElementById('c');
+const fsCanvas=document.getElementById('fs-canvas');
+mainCanvas.addEventListener('touchstart',onTouchStart,{passive:false});
+mainCanvas.addEventListener('touchmove', onTouchMove, {passive:false});
+mainCanvas.addEventListener('touchend',  onTouchEnd,  {passive:false});
+fsCanvas.addEventListener('touchstart',onTouchStart,{passive:false});
+fsCanvas.addEventListener('touchmove', onTouchMove, {passive:false});
+fsCanvas.addEventListener('touchend',  onTouchEnd,  {passive:false});
 
 // ── Seafood types ──────────────────────────────────────────────────────────────
 const SEAFOOD_TYPES = ['fish','shrimp','crab','lobster'];
-
 const SEAFOOD_INFO = {
-  fish:    { label: '🐟 x2 score!',    desc: 'doubles points for 15s', color: '#f09070' },
-  shrimp:  { label: '🦐 +1 heart!',    desc: 'extra life buffer',      color: '#f0b090' },
-  crab:    { label: '🦀 bullet time!', desc: 'pipes slow, moo stays fast', color: '#e06050' },
-  lobster: { label: '🦞 +5 points!',   desc: 'instant bonus score',    color: '#e05050' },
+  fish:    { label:'🐟 x2 score!',    desc:'doubles points for 15s',          color:'#f09070' },
+  shrimp:  { label:'🦐 +1 heart!',    desc:'extra life buffer',                color:'#f0b090' },
+  crab:    { label:'🦀 bullet time!', desc:'pipes slow, moo stays fast',       color:'#e06050' },
+  lobster: { label:'🦞 +5 points!',   desc:'instant bonus score',              color:'#e05050' },
 };
 
 function spawnSeafood(x) {
   const gh=S(GROUND_H), minY=S(55), maxY=H-gh-S(40);
-  // Only offer crab (slow-mo) once player has hit 500 points
-  const pool = score >= 500 ? SEAFOOD_TYPES : SEAFOOD_TYPES.filter(t => t !== 'crab');
-  return {
-    x,
-    y: minY+Math.random()*(maxY-minY),
-    type: pool[Math.floor(Math.random()*pool.length)],
-    pulse: Math.random()*Math.PI*2,
-    bobOffset: Math.random()*Math.PI*2,
-  };
+  const pool=score>=500?SEAFOOD_TYPES:SEAFOOD_TYPES.filter(t=>t!=='crab');
+  return { x, y:minY+Math.random()*(maxY-minY), type:pool[Math.floor(Math.random()*pool.length)], pulse:Math.random()*Math.PI*2, bobOffset:Math.random()*Math.PI*2 };
 }
 
 // ── Drawing ────────────────────────────────────────────────────────────────────
@@ -417,16 +496,29 @@ function drawGround() {
     ctx.fillStyle='#20203a'; ctx.fillRect(x,H-gh+S(9),S(18),S(3));
   }
 }
-function drawPipe(x,topH) {
-  const pw=S(PIPE_W),gh=S(GROUND_H),gap=S(GAP);
-  const botY=topH+gap,botH=H-gh-botY;
+
+// drawPipe now takes a full pipe object so it can use per-pipe gap and drift
+function drawPipe(p) {
+  const x=p.x, topH=p.topH;
+  const effGap=getEffectiveGap(p);
+  const pw=S(PIPE_W), gh=S(GROUND_H);
+  const botY=topH+effGap, botH=H-gh-botY;
+  const col=getPipeColors();
   [{y:0,h:topH,cap:topH-S(13)},{y:botY,h:botH,cap:botY}].forEach(({y,h,cap})=>{
-    ctx.fillStyle=PAL.pipe; ctx.fillRect(x+S(4),y,pw-S(8),h);
-    ctx.fillStyle=PAL.pipeBorder; ctx.fillRect(x,cap,pw,S(13));
-    ctx.fillStyle=PAL.pipeHighlight;
+    ctx.fillStyle=col.body; ctx.fillRect(x+S(4),y,pw-S(8),h);
+    ctx.fillStyle=col.border; ctx.fillRect(x,cap,pw,S(13));
+    ctx.fillStyle=col.highlight;
     ctx.fillRect(x+S(4),cap+S(2),S(5),S(9));
     ctx.fillRect(x+S(4),y,S(3),h);
   });
+  // Draw oscillation indicator: subtle pulsing tint on caps when oscillating
+  if(p.gapOscillate){
+    ctx.save(); ctx.globalAlpha=0.18+0.12*Math.abs(Math.sin(p.gapPhase));
+    ctx.fillStyle='#a0d0ff';
+    ctx.fillRect(x,topH-S(13),pw,S(13));
+    ctx.fillRect(x,botY,pw,S(13));
+    ctx.restore();
+  }
 }
 
 function drawHeart(x,y,size,alpha) {
@@ -487,18 +579,13 @@ function drawWingsIcon(x,y,size,alpha) {
 function drawMagnetIcon(x,y,size,alpha) {
   ctx.save(); ctx.globalAlpha=alpha;
   const s=size;
-  // Glow
   const gr=ctx.createRadialGradient(x,y,0,x,y,s*1.5);
   gr.addColorStop(0,'rgba(255,100,100,0.35)'); gr.addColorStop(1,'rgba(255,100,100,0)');
   ctx.fillStyle=gr; ctx.beginPath(); ctx.arc(x,y,s*1.5,0,Math.PI*2); ctx.fill();
-  // Horseshoe arc
   ctx.strokeStyle=PAL.magnet; ctx.lineWidth=s*0.38; ctx.lineCap='round';
   ctx.beginPath(); ctx.arc(x,y+s*0.15,s*0.62,Math.PI,0,false); ctx.stroke();
-  // Left leg
   ctx.beginPath(); ctx.moveTo(x-s*0.62,y+s*0.15); ctx.lineTo(x-s*0.62,y+s*0.72); ctx.stroke();
-  // Right leg
   ctx.beginPath(); ctx.moveTo(x+s*0.62,y+s*0.15); ctx.lineTo(x+s*0.62,y+s*0.72); ctx.stroke();
-  // Silver tips
   ctx.strokeStyle='#dddddd'; ctx.lineWidth=s*0.38;
   ctx.beginPath(); ctx.moveTo(x-s*0.62,y+s*0.5); ctx.lineTo(x-s*0.62,y+s*0.78); ctx.stroke();
   ctx.beginPath(); ctx.moveTo(x+s*0.62,y+s*0.5); ctx.lineTo(x+s*0.62,y+s*0.78); ctx.stroke();
@@ -508,17 +595,13 @@ function drawMagnetIcon(x,y,size,alpha) {
 function drawMagnifyIcon(x,y,size,alpha) {
   ctx.save(); ctx.globalAlpha=alpha;
   const s=size;
-  // Glow
   const gr=ctx.createRadialGradient(x,y,0,x,y,s*1.5);
   gr.addColorStop(0,'rgba(100,220,255,0.35)'); gr.addColorStop(1,'rgba(100,220,255,0)');
   ctx.fillStyle=gr; ctx.beginPath(); ctx.arc(x,y,s*1.5,0,Math.PI*2); ctx.fill();
-  // Lens circle
   ctx.strokeStyle=PAL.magnify; ctx.lineWidth=s*0.22;
   ctx.beginPath(); ctx.arc(x-s*0.1,y-s*0.1,s*0.62,0,Math.PI*2); ctx.stroke();
-  // Handle
   ctx.strokeStyle='#88bbdd'; ctx.lineWidth=s*0.26; ctx.lineCap='round';
   ctx.beginPath(); ctx.moveTo(x+s*0.33,y+s*0.33); ctx.lineTo(x+s*0.82,y+s*0.82); ctx.stroke();
-  // Plus sign inside lens
   ctx.strokeStyle=PAL.magnify; ctx.lineWidth=s*0.16;
   ctx.beginPath(); ctx.moveTo(x-s*0.1,y-s*0.52); ctx.lineTo(x-s*0.1,y+s*0.32); ctx.stroke();
   ctx.beginPath(); ctx.moveTo(x-s*0.52,y-s*0.1); ctx.lineTo(x+s*0.32,y-s*0.1); ctx.stroke();
@@ -545,9 +628,7 @@ function drawShrimp(x,y,s,alpha) {
   ctx.save(); ctx.globalAlpha=alpha;
   ctx.fillStyle='#f08060';
   for(let i=0;i<5;i++){
-    const bx=x+Math.sin(i*0.6)*s*0.18;
-    const by=y-s*0.6+i*s*0.28;
-    const r=s*(0.22-i*0.025);
+    const bx=x+Math.sin(i*0.6)*s*0.18, by=y-s*0.6+i*s*0.28, r=s*(0.22-i*0.025);
     ctx.beginPath(); ctx.ellipse(bx,by,r,r*0.7,0,0,Math.PI*2); ctx.fill();
   }
   ctx.fillStyle='#e06850';
@@ -620,7 +701,6 @@ function drawSeafoodItem(c, magnifyScale) {
   const y=c.y+bob;
   const pulse=1+0.08*Math.sin(c.pulse);
   const info=SEAFOOD_INFO[c.type];
-  // glow
   ctx.save(); ctx.globalAlpha=0.22+0.08*Math.sin(c.pulse);
   const gr=ctx.createRadialGradient(c.x,y,0,c.x,y,s*1.8);
   gr.addColorStop(0,info.color); gr.addColorStop(1,'rgba(0,0,0,0)');
@@ -630,7 +710,6 @@ function drawSeafoodItem(c, magnifyScale) {
   if(c.type==='shrimp')  drawShrimp(c.x,y,s*pulse,0.95);
   if(c.type==='crab')    drawCrab(c.x,y,s*pulse,0.95);
   if(c.type==='lobster') drawLobster(c.x,y,s*pulse,0.95);
-  // label under the item (label stays same size regardless of magnify)
   ctx.save();
   ctx.font='500 '+Math.round(S(8))+'px monospace';
   ctx.textAlign='center'; ctx.fillStyle=info.color; ctx.globalAlpha=0.75;
@@ -639,12 +718,11 @@ function drawSeafoodItem(c, magnifyScale) {
 }
 
 function drawCollectibles() {
-  const msc = magnifyActive ? 3 : 1;
+  const msc=magnifyActive?3:1;
   for(const c of collectibles){
     c.pulse=(c.pulse||0)+0.08;
     if(c.type==='heart'){
-      const sc=msc*(1+0.1*Math.sin(c.pulse));
-      drawHeart(c.x,c.y,S(10)*sc,0.92);
+      drawHeart(c.x,c.y,S(10)*msc*(1+0.1*Math.sin(c.pulse)),0.92);
     } else if(c.type==='shield'){
       const sc=msc*(1+0.07*Math.sin(c.pulse));
       drawShieldIcon(c.x,c.y,S(10)*sc,0.88+0.08*Math.sin(c.pulse));
@@ -659,73 +737,62 @@ function drawCollectibles() {
       drawMagnifyIcon(c.x,c.y,S(11)*sc,0.88+0.08*Math.sin(c.pulse));
     } else {
       c.bobOffset=c.bobOffset||0;
-      drawSeafoodItem(c, msc);
+      drawSeafoodItem(c,msc);
     }
   }
 }
 
 // ── HUD ────────────────────────────────────────────────────────────────────────
 function drawHUD() {
-  // Hearts row top-left
   for(let i=0;i<hearts;i++) drawHeart(S(14)+i*S(17),S(14),S(7),1);
 
-  // Power timers stacked top-right
   let rowY=S(14);
   const rightX=W-S(10);
 
-  if(shieldActive && shieldTimer>0){
+  if(shieldActive&&shieldTimer>0){
     const secs=Math.ceil(shieldTimer/60);
-    const pulse=0.8+0.2*Math.sin(frame*0.15);
-    drawShieldIcon(W-S(36),rowY,S(8),pulse);
+    drawShieldIcon(W-S(36),rowY,S(8),0.8+0.2*Math.sin(frame*0.15));
     ctx.font='600 '+Math.round(S(11))+'px monospace';
     ctx.textAlign='right'; ctx.fillStyle=PAL.shield; ctx.globalAlpha=0.9;
     ctx.fillText(secs+'s',rightX,rowY+S(4)); ctx.globalAlpha=1; rowY+=S(22);
   }
-
-  if(wingsActive && wingsTimer>0){
+  if(wingsActive&&wingsTimer>0){
     const secs=Math.ceil(wingsTimer/60);
     const warn=wingsTimer<=WINGS_WARN;
-    const pulse=warn?(0.5+0.5*Math.sin(frame*0.25)):0.9;
-    drawWingsIcon(W-S(36),rowY,S(8),pulse);
+    drawWingsIcon(W-S(36),rowY,S(8),warn?(0.5+0.5*Math.sin(frame*0.25)):0.9);
     ctx.font='600 '+Math.round(S(11))+'px monospace';
     ctx.textAlign='right'; ctx.fillStyle=warn?'#ffb020':PAL.wings; ctx.globalAlpha=0.9;
     ctx.fillText(secs+'s',rightX,rowY+S(4)); ctx.globalAlpha=1; rowY+=S(22);
   }
-
-  if(seafoodDoubler && seafoodDoublerTimer>0){
+  if(seafoodDoubler&&seafoodDoublerTimer>0){
     const secs=Math.ceil(seafoodDoublerTimer/60);
     ctx.font='600 '+Math.round(S(10))+'px monospace';
     ctx.textAlign='right'; ctx.fillStyle='#f09070'; ctx.globalAlpha=0.88;
     ctx.fillText('x2 '+secs+'s',rightX,rowY+S(4)); ctx.globalAlpha=1; rowY+=S(18);
   }
-
-  if(slowmo && slowmoTimer>0){
+  if(slowmo&&slowmoTimer>0){
     const secs=Math.ceil(slowmoTimer/60);
     ctx.font='600 '+Math.round(S(10))+'px monospace';
     ctx.textAlign='right'; ctx.fillStyle='#80e0ff'; ctx.globalAlpha=0.88;
     ctx.fillText('slow '+secs+'s',rightX,rowY+S(4)); ctx.globalAlpha=1; rowY+=S(18);
   }
-
-  if(magnetActive && magnetTimer>0){
+  if(magnetActive&&magnetTimer>0){
     const secs=Math.ceil(magnetTimer/60);
     drawMagnetIcon(W-S(36),rowY,S(8),0.9);
     ctx.font='600 '+Math.round(S(10))+'px monospace';
     ctx.textAlign='right'; ctx.fillStyle=PAL.magnet; ctx.globalAlpha=0.88;
     ctx.fillText(secs+'s',rightX,rowY+S(4)); ctx.globalAlpha=1; rowY+=S(22);
   }
-
-  if(magnifyActive && magnifyTimer>0){
+  if(magnifyActive&&magnifyTimer>0){
     const secs=Math.ceil(magnifyTimer/60);
     drawMagnifyIcon(W-S(36),rowY,S(8),0.9);
     ctx.font='600 '+Math.round(S(10))+'px monospace';
     ctx.textAlign='right'; ctx.fillStyle=PAL.magnify; ctx.globalAlpha=0.88;
     ctx.fillText('3x '+secs+'s',rightX,rowY+S(4)); ctx.globalAlpha=1; rowY+=S(22);
   }
-
   ctx.textAlign='left';
 
-  // Wings fading warning
-  if(wingsActive && wingsTimer>0 && wingsTimer<=WINGS_WARN){
+  if(wingsActive&&wingsTimer>0&&wingsTimer<=WINGS_WARN){
     const alpha=(Math.sin(frame*0.2)+1)*0.5*0.7;
     ctx.save(); ctx.globalAlpha=alpha;
     ctx.fillStyle='#ffb020'; ctx.font='500 '+Math.round(S(12))+'px monospace';
@@ -733,50 +800,31 @@ function drawHUD() {
     ctx.fillText('wings fading!',W/2,H-S(GROUND_H)-S(18));
     ctx.restore();
   }
-
-  // Slowmo tint
   if(slowmo){
-    ctx.save(); ctx.globalAlpha=0.08;
-    ctx.fillStyle='#80d8ff'; ctx.fillRect(0,0,W,H);
-    ctx.restore();
+    ctx.save(); ctx.globalAlpha=0.08; ctx.fillStyle='#80d8ff'; ctx.fillRect(0,0,W,H); ctx.restore();
   }
-
-  // Magnify tint
   if(magnifyActive){
-    ctx.save(); ctx.globalAlpha=0.06;
-    ctx.fillStyle=PAL.magnify; ctx.fillRect(0,0,W,H);
-    ctx.restore();
+    ctx.save(); ctx.globalAlpha=0.06; ctx.fillStyle=PAL.magnify; ctx.fillRect(0,0,W,H); ctx.restore();
   }
-
-  // Magnet field effect (subtle)
   if(magnetActive){
-    ctx.save(); ctx.globalAlpha=0.06+0.03*Math.sin(frame*0.18);
-    ctx.fillStyle=PAL.magnet; ctx.fillRect(0,0,W,H);
-    ctx.restore();
+    ctx.save(); ctx.globalAlpha=0.06+0.03*Math.sin(frame*0.18); ctx.fillStyle=PAL.magnet; ctx.fillRect(0,0,W,H); ctx.restore();
   }
-
-  // Score doubler ring
   if(seafoodDoubler){
     ctx.save(); ctx.globalAlpha=0.4+0.2*Math.sin(frame*0.2);
     ctx.strokeStyle='#f09070'; ctx.lineWidth=S(1.5);
     ctx.beginPath(); ctx.arc(W/2,S(34),S(22),0,Math.PI*2); ctx.stroke();
     ctx.restore();
   }
-
-  // Popup notification (seafood pickup)
-  if(popup && popup.timer>0){
-    const alpha=Math.min(1, popup.timer/30);
+  if(popup&&popup.timer>0){
+    const alpha=Math.min(1,popup.timer/30);
     const rise=(100-popup.timer)*0.4;
-    ctx.save();
-    ctx.globalAlpha=alpha;
-    ctx.font='700 '+Math.round(S(13))+'px monospace';
-    ctx.textAlign='center';
+    ctx.save(); ctx.globalAlpha=alpha;
+    ctx.font='700 '+Math.round(S(13))+'px monospace'; ctx.textAlign='center';
     ctx.fillStyle='rgba(0,0,0,0.5)';
-    ctx.fillText(popup.text, popup.x+S(1), popup.y-rise+S(1));
+    ctx.fillText(popup.text,popup.x+S(1),popup.y-rise+S(1));
     ctx.fillStyle=popup.color;
-    ctx.fillText(popup.text, popup.x, popup.y-rise);
-    ctx.restore();
-    popup.timer--;
+    ctx.fillText(popup.text,popup.x,popup.y-rise);
+    ctx.restore(); popup.timer--;
   }
 }
 
@@ -807,12 +855,10 @@ function drawWingsAura() {
   ctx.fillStyle=PAL.wings; ctx.globalAlpha=0.85;
   ctx.beginPath(); ctx.moveTo(-4*sc,-2*sc);
   ctx.bezierCurveTo(-10*sc,(-14+wf*6)*sc,-18*sc,(-8+wf*4)*sc,-16*sc,(2+wf*3)*sc);
-  ctx.bezierCurveTo(-10*sc,0,-5*sc,-1*sc,-4*sc,-2*sc);
-  ctx.fill();
+  ctx.bezierCurveTo(-10*sc,0,-5*sc,-1*sc,-4*sc,-2*sc); ctx.fill();
   ctx.beginPath(); ctx.moveTo(4*sc,-2*sc);
   ctx.bezierCurveTo(10*sc,(-14+wf*6)*sc,18*sc,(-8+wf*4)*sc,16*sc,(2+wf*3)*sc);
-  ctx.bezierCurveTo(10*sc,0,5*sc,-1*sc,4*sc,-2*sc);
-  ctx.fill();
+  ctx.bezierCurveTo(10*sc,0,5*sc,-1*sc,4*sc,-2*sc); ctx.fill();
   ctx.restore();
 }
 
@@ -877,13 +923,14 @@ function drawCat(cx,cy,angle,dead) {
 
 // ── Collision ──────────────────────────────────────────────────────────────────
 function checkCollision() {
-  const r=S(8),gh=S(GROUND_H),gap=S(GAP),pw=S(PIPE_W);
+  const r=S(8), gh=S(GROUND_H), pw=S(PIPE_W);
   if(cat.y-r>=H) return 'fall';
   if(cat.y-r<=0) return 'pipe';
   if(cat.y+r>=H-gh) return 'pipe';
   for(const p of pipes){
     if(cat.x+r>p.x+S(4) && cat.x-r<p.x+pw-S(4)){
-      if(cat.y-r<p.topH || cat.y+r>p.topH+gap) return 'pipe';
+      const effGap=getEffectiveGap(p);
+      if(cat.y-r<p.topH || cat.y+r>p.topH+effGap){ lastHitPipe=p; return 'pipe'; }
     }
   }
   return false;
@@ -899,10 +946,8 @@ function drawScore() {
 function drawCountdown() {
   ctx.fillStyle='rgba(10,10,20,0.45)'; ctx.fillRect(0,0,W,H);
   const progress=countdownFrames/70;
-  const sc=1+(1-progress)*0.35;
-  const alpha=Math.min(1,progress*2.5);
-  ctx.save(); ctx.translate(W/2,H/2-S(10)); ctx.scale(sc,sc);
-  ctx.globalAlpha=alpha;
+  const sc=1+(1-progress)*0.35, alpha=Math.min(1,progress*2.5);
+  ctx.save(); ctx.translate(W/2,H/2-S(10)); ctx.scale(sc,sc); ctx.globalAlpha=alpha;
   ctx.fillStyle=countdownVal===0?'#88e0a0':PAL.ui;
   ctx.font='700 '+Math.round(S(68))+'px monospace'; ctx.textAlign='center';
   ctx.fillText(countdownVal===0?'GO!':String(countdownVal),0,0);
@@ -935,7 +980,7 @@ function drawOverlay() {
     ctx.fillText('moo did not survive',W/2,H/2-46*fs);
     ctx.fillStyle=PAL.ui; ctx.font='500 '+Math.round(38*fs)+'px monospace';
     ctx.fillText(score,W/2,H/2+4*fs);
-    if(score>=bestScore && score>0){
+    if(score>=bestScore&&score>0){
       ctx.fillStyle='#c8b060'; ctx.font=Math.round(12*fs)+'px monospace';
       ctx.fillText('new best!',W/2,H/2+26*fs);
     }
@@ -960,100 +1005,166 @@ function update() {
 
   frame++;
 
-  // ── Slowmo: world (pipes, collectibles, ground) slows to 30%.
-  //    Moo's gravity & jump are FULL speed — only world moves slowly.
-  const worldSlow = slowmo ? 0.3 : 1;
-  const g = GRAVITY*(H/460);
-  const spd = BASE_SPEED*speedMult*(W/420)*worldSlow;
+  const worldSlow=slowmo?0.3:1;
+  const g=GRAVITY*(H/460);
+  const spd=BASE_SPEED*speedMult*(W/420)*worldSlow;
 
-  // ── Wings mode ────────────────────────────────────────────────────────────
+  // ── Wings ────────────────────────────────────────────────────────────────
   if(wingsActive){
     cat.vy=0; cat.angle=0;
-    // Wings: keyboard ArrowUp/Down or mobile touch (above/below Moo)
-    const goUp   = keys['ArrowUp']   || (touchCanvasY !== null && touchCanvasY < cat.y - S(8));
-    const goDown = keys['ArrowDown'] || (touchCanvasY !== null && touchCanvasY > cat.y + S(8));
-    if(goUp)   cat.y=Math.max(cat.y-WINGS_SPEED, S(16));
-    if(goDown) cat.y=Math.min(cat.y+WINGS_SPEED, H-S(GROUND_H)-S(16));
+    const goUp  =keys['ArrowUp']  ||(touchCanvasY!==null&&touchCanvasY<cat.y-S(8));
+    const goDown=keys['ArrowDown']||(touchCanvasY!==null&&touchCanvasY>cat.y+S(8));
+    if(goUp)   cat.y=Math.max(cat.y-WINGS_SPEED,S(16));
+    if(goDown) cat.y=Math.min(cat.y+WINGS_SPEED,H-S(GROUND_H)-S(16));
     wingsTimer--;
     if(wingsTimer<=0){ wingsActive=false; wingsTimer=0; }
   } else {
-    // ── Normal physics ───────────────────────────────────────────────────
     cat.vy+=g; cat.y+=cat.vy;
     cat.angle=Math.min(Math.max(cat.vy*0.06,-0.5),1.1);
     if(cat.invincible>0) cat.invincible--;
   }
 
-  // Speed ramp +8% per 10 pts
   const targetMult=1+Math.floor(score/10)*0.08;
   speedMult+=(targetMult-speedMult)*0.015;
 
-  // Power timers (all run at real time, not slowed)
   if(shieldActive){ shieldTimer--; if(shieldTimer<=0){ shieldActive=false; shieldTimer=0; } }
   if(seafoodDoubler){ seafoodDoublerTimer--; if(seafoodDoublerTimer<=0){ seafoodDoubler=false; } }
   if(slowmo){ slowmoTimer--; if(slowmoTimer<=0){ slowmo=false; slowmoTimer=0; } }
   if(magnetActive){ magnetTimer--; if(magnetTimer<=0){ magnetActive=false; magnetTimer=0; } }
   if(magnifyActive){ magnifyTimer--; if(magnifyTimer<=0){ magnifyActive=false; magnifyTimer=0; } }
 
-  // Pipe spawn (countdown runs at real time)
+  // ── Pipe spawn ───────────────────────────────────────────────────────────
   nextPipeIn--;
   if(nextPipeIn<=0){
-    const gap=S(GAP),gh=S(GROUND_H),minTop=S(65),maxTop=H-gh-gap-S(65);
-    const topH=minTop+Math.random()*(maxTop-minTop);
-    pipes.push({x:W+10,topH,scored:false});
+    const gh=S(GROUND_H);
 
-    if(Math.random() < 0.30){
-      const cy=topH+gap/2+(Math.random()-0.5)*gap*0.28;
+    // Determine gap size (wide/narrow rhythm on top of score-based shrink)
+    let baseGap=getBaseGap();
+    if(nextPipeIsNarrow){
+      baseGap=Math.max(MIN_GAP, Math.round(baseGap*0.78));
+      nextPipeIsNarrow=false;
+    } else if(Math.random()<0.18){
+      baseGap=Math.min(MAX_GAP+15, Math.round(baseGap*1.32));
+      nextPipeIsNarrow=true;
+    }
+
+    const gapPx=S(baseGap);
+    const minTop=S(65), maxTop=H-gh-gapPx-S(65);
+
+    // High/low alternation: 70% chance to bias opposite of last pipe
+    let topH;
+    if(lastPipeHigh===null||Math.random()<0.30){
+      topH=minTop+Math.random()*(maxTop-minTop);
+    } else if(lastPipeHigh){
+      // Last gap was high → bias low
+      topH=minTop+(maxTop-minTop)*(0.45+Math.random()*0.55);
+    } else {
+      // Last gap was low → bias high
+      topH=minTop+(maxTop-minTop)*Math.random()*0.55;
+    }
+    topH=Math.max(minTop,Math.min(topH,maxTop));
+    lastPipeHigh=(topH+gapPx/2)<H*0.5;
+
+    // Drift: 40% of pipes slowly move vertically
+    const driftSpeed=Math.random()<0.40?(Math.random()-0.5)*0.55:0;
+    // Gap oscillation: 28% of pipes pulse their gap size
+    const gapOscillate=Math.random()<0.28;
+
+    pipes.push({x:W+10, topH, gap:baseGap, drift:driftSpeed, gapPhase:0, gapOscillate, scored:false, minClearance:Infinity});
+
+    // ── Collectible in gap ─────────────────────────────────────────────
+    if(Math.random()<0.30){
       const roll=Math.random();
       let type;
-      if(roll<0.04)       type='wings';
-      else if(roll<0.19)  type='magnet';
-      else if(roll<0.34)  type='magnify';
-      else if(roll<0.65)  type='shield';
-      else if(hearts<5)   type='heart';
-      else                type='shield';
+      if(roll<0.04)      type='wings';
+      else if(roll<0.19) type='magnet';
+      else if(roll<0.34) type='magnify';
+      else if(roll<0.65) type='shield';
+      else if(hearts<5)  type='heart';
+      else               type='shield';
+
+      // 20% of the time: place at gap edge instead of centre (risky grab)
+      const edgeMounted=Math.random()<0.20;
+      let cy;
+      if(edgeMounted){
+        const atTop=Math.random()<0.5;
+        cy=atTop ? topH+S(14) : topH+gapPx-S(14);
+        type=(Math.random()<0.5)?'heart':'shield'; // edge items are always hearts or shields
+      } else {
+        cy=topH+gapPx/2+(Math.random()-0.5)*gapPx*0.28;
+      }
       collectibles.push({x:W+10+S(PIPE_W)*0.5, y:cy, type, pulse:Math.random()*Math.PI*2});
     }
 
+    // ── Seafood between pipes ──────────────────────────────────────────
     if(Math.random()<0.20){
-      const c=spawnSeafood(W+10+S(PIPE_W)+S(20)+Math.random()*S(60));
-      collectibles.push(c);
+      collectibles.push(spawnSeafood(W+10+S(PIPE_W)+S(20)+Math.random()*S(60)));
     }
 
     nextPipeIn=getNextInterval();
   }
 
-  // Move world at world speed (slowmo affects this)
-  pipes.forEach(p=>p.x-=spd);
+  // ── Move world ───────────────────────────────────────────────────────────
+  pipes.forEach(p=>{
+    p.x-=spd;
+    // Drift
+    if(p.drift!==0){
+      p.topH+=p.drift*worldSlow;
+      const effGap=getEffectiveGap(p);
+      const minT=S(60), maxT=H-S(GROUND_H)-effGap-S(60);
+      if(p.topH<=minT||p.topH>=maxT) p.drift*=-1;
+      p.topH=Math.max(minT,Math.min(p.topH,maxT));
+    }
+    // Gap oscillation
+    if(p.gapOscillate) p.gapPhase+=0.025;
+    // Track minimum clearance while Moo is overlapping this pipe in x
+    if(!p.scored&&!cat.dead){
+      const pw=S(PIPE_W),r=S(8);
+      if(cat.x+r>p.x+S(4)&&cat.x-r<p.x+pw-S(4)){
+        const effGap=getEffectiveGap(p);
+        const clearTop=cat.y-r-p.topH;
+        const clearBot=p.topH+effGap-(cat.y+r);
+        p.minClearance=Math.min(p.minClearance,Math.min(clearTop,clearBot));
+      }
+    }
+  });
   pipes=pipes.filter(p=>p.x+S(PIPE_W)>-10);
   collectibles.forEach(c=>c.x-=spd);
   collectibles=collectibles.filter(c=>c.x+S(20)>-10);
 
-  // Magnet: attract all collectibles toward Moo
+  // ── Magnet ───────────────────────────────────────────────────────────────
   if(magnetActive){
     collectibles.forEach(c=>{
       const dx=cat.x-c.x, dy=cat.y-c.y;
       const dist=Math.sqrt(dx*dx+dy*dy);
-      if(dist>S(5)){
-        const pull=Math.min(6, dist*0.06+1);
-        c.x+=(dx/dist)*pull;
-        c.y+=(dy/dist)*pull;
-      }
+      if(dist>S(5)){ const pull=Math.min(6,dist*0.06+1); c.x+=(dx/dist)*pull; c.y+=(dy/dist)*pull; }
     });
   }
 
-  // Score — only while Moo is alive (prevents post-death score drift)
+  // ── Particles update ─────────────────────────────────────────────────────
+  nearMissSparks.forEach(s=>{s.x+=s.vx; s.y+=s.vy; s.vy+=0.08; s.life--;});
+  nearMissSparks=nearMissSparks.filter(s=>s.life>0);
+  shatterParticles.forEach(s=>{s.x+=s.vx; s.y+=s.vy; s.vy+=0.12; s.life--;});
+  shatterParticles=shatterParticles.filter(s=>s.life>0);
+
+  // ── Score ─────────────────────────────────────────────────────────────────
   if(!cat.dead){
     for(const p of pipes){
-      if(!p.scored && p.x+S(PIPE_W)<cat.x){
+      if(!p.scored&&p.x+S(PIPE_W)<cat.x){
         p.scored=true;
         score+=(seafoodDoubler?2:1); updateScoreUI();
+        // Near-miss: did Moo pass with less than 18px clearance?
+        if(cat.invincible<=0&&p.minClearance<S(18)&&p.minClearance>=0){
+          spawnNearMissSparks(cat.x,cat.y);
+          showPopup('close!','#ffee60',cat.x,cat.y-S(28));
+        }
       }
     }
   }
 
-  // Collect items
+  // ── Collect items ─────────────────────────────────────────────────────────
   if(!cat.dead){
-    const collectRadius = magnifyActive ? S(32) : S(18);
+    const collectRadius=magnifyActive?S(32):S(18);
     collectibles=collectibles.filter(c=>{
       const dx=c.x-cat.x, dy=c.y-cat.y;
       if(Math.sqrt(dx*dx+dy*dy)<collectRadius){
@@ -1061,10 +1172,8 @@ function update() {
           if(hearts<5){ hearts++; playHeartCollect(); showPopup('+1 heart!','#e85580',cat.x,cat.y-S(25)); }
         } else if(c.type==='shield'){
           if(shieldActive){
-            // Already shielded: only add 3 seconds instead of full 10
-            shieldTimer=Math.min(shieldTimer+180, SHIELD_DURATION);
-            playShieldCollect();
-            showPopup('+3s shield!',PAL.shield,cat.x,cat.y-S(25));
+            shieldTimer=Math.min(shieldTimer+180,SHIELD_DURATION);
+            playShieldCollect(); showPopup('+3s shield!',PAL.shield,cat.x,cat.y-S(25));
           } else {
             shieldActive=true; shieldTimer=SHIELD_DURATION; playShieldCollect();
             showPopup('shield on!',PAL.shield,cat.x,cat.y-S(25));
@@ -1078,6 +1187,13 @@ function update() {
         } else if(c.type==='magnify'){
           magnifyActive=true; magnifyTimer=MAGNIFY_DURATION; playMagnifyCollect();
           showPopup('3x size!',PAL.magnify,cat.x,cat.y-S(25));
+          // Guarantee 2 collectibles during magnify window
+          const gh2=S(GROUND_H),minY2=S(55),maxY2=H-gh2-S(40);
+          const pool2=['heart','shield','heart','shield','fish','shrimp','lobster'];
+          [S(180),S(340)].forEach(offset=>{
+            const gt=pool2[Math.floor(Math.random()*pool2.length)];
+            collectibles.push({x:W+offset, y:minY2+Math.random()*(maxY2-minY2), type:gt, pulse:Math.random()*Math.PI*2, bobOffset:Math.random()*Math.PI*2});
+          });
         } else if(c.type==='fish'){
           const info=SEAFOOD_INFO[c.type];
           seafoodDoubler=true; seafoodDoublerTimer=900; playSeafoodCollect();
@@ -1101,8 +1217,9 @@ function update() {
     });
   }
 
-  // Collision — wings = immune to pipes, never immune to fall
-  const isImmuneViaPower = wingsActive;
+  // ── Collision ─────────────────────────────────────────────────────────────
+  lastHitPipe=null;
+  const isImmuneViaPower=wingsActive;
   if(!cat.dead){
     const hit=checkCollision();
     if(hit==='fall'){
@@ -1110,16 +1227,16 @@ function update() {
       if(score>bestScore){ bestScore=score; updateBestUI(); }
       showPauseBtn(false);
       setTimeout(()=>{ state='dead'; },600);
-    } else if(hit==='pipe' && !isImmuneViaPower && cat.invincible<=0){
+    } else if(hit==='pipe'&&!isImmuneViaPower&&cat.invincible<=0){
       if(shieldActive){
+        // Shield absorbs hit: shatter the pipe it hit
+        if(lastHitPipe){ shatterPipe(lastHitPipe); pipes=pipes.filter(p=>p!==lastHitPipe); playShatter(); }
+        else { playOww(); }
         cat.invincible=60; hitFlashTimer=10;
         cat.vy=JUMP*(H/460)*0.4;
-        playOww();
       } else if(hearts>0){
-        hearts--;
-        cat.invincible=60; hitFlashTimer=10;
-        cat.vy=JUMP*(H/460)*0.4;
-        playOww();
+        hearts--; cat.invincible=60; hitFlashTimer=10;
+        cat.vy=JUMP*(H/460)*0.4; playOww();
       } else {
         cat.dead=true; flashTimer=8; playSadMeow();
         if(score>bestScore){ bestScore=score; updateBestUI(); }
@@ -1140,18 +1257,34 @@ function render(){
   }
 
   drawBackground();
-  pipes.forEach(p=>drawPipe(p.x,p.topH));
+  pipes.forEach(p=>drawPipe(p));
+
+  // Shatter particles (behind collectibles and Moo)
+  shatterParticles.forEach(s=>{
+    ctx.save(); ctx.globalAlpha=s.life/s.maxLife*0.88;
+    ctx.fillStyle=s.color;
+    ctx.beginPath(); ctx.arc(s.x,s.y,S(2.2),0,Math.PI*2); ctx.fill();
+    ctx.restore();
+  });
+
   drawCollectibles();
   drawGround();
 
   if(state!=='idle'){
-    drawShieldAura();
-    drawWingsAura();
+    drawShieldAura(); drawWingsAura();
     const blink=cat.invincible>0?Math.floor(frame/3)%2===0:true;
     if(blink) drawCat(cat.x,cat.y,cat.angle,cat.dead);
   } else {
     drawCat(W/2-S(40),H/2-S(20),0,false);
   }
+
+  // Near-miss sparks (in front of Moo)
+  nearMissSparks.forEach(s=>{
+    ctx.save(); ctx.globalAlpha=s.life/s.maxLife*0.9;
+    ctx.fillStyle='#ffee60';
+    ctx.beginPath(); ctx.arc(s.x,s.y,S(2.5),0,Math.PI*2); ctx.fill();
+    ctx.restore();
+  });
 
   if(state==='playing'||state==='paused'){ drawScore(); drawHUD(); }
   if(state==='countdown') drawCountdown();
@@ -1166,9 +1299,8 @@ function render(){
   drawOverlay();
 }
 
-// Also allow P key for pause
 document.addEventListener('keydown', e => {
-  if(e.code==='KeyP' && (state==='playing'||state==='paused')) togglePause();
+  if(e.code==='KeyP'&&(state==='playing'||state==='paused')) togglePause();
 });
 
 function loop(){ update(); render(); requestAnimationFrame(loop); }

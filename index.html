@@ -82,6 +82,12 @@ let nextPipeIn = 0, pipeCount = 0;
 let keys = {};
 let touchCanvasY = null;
 
+// Delta-time: normalised to 1.0 at 60 fps. Applied to every per-frame value so
+// the game runs at the same real-world speed on any refresh rate.
+let dt = 1;
+let lastTime = null;
+let groundScroll = 0; // accumulated ground-stripe offset (replaces frame*spd)
+
 // Popup notification
 let popup = null;
 
@@ -381,6 +387,7 @@ function resetGame() {
   nextPipeIn=FIRST_PIPE_DELAY;
   lastPipeHigh=null; pendingDoublePipe=false; nextPipeIsNarrow=false; lastHitPipe=null;
   shatterParticles=[]; nearMissSparks=[];
+  groundScroll=0;
   updateScoreUI();
   updateBestUI();
   showPauseBtn(false);
@@ -489,10 +496,10 @@ function drawBackground() {
   drawStars(); drawMoon();
 }
 function drawGround() {
-  const gh=S(GROUND_H), spd=BASE_SPEED*speedMult*(W/420)*(slowmo?0.3:1);
+  const gh=S(GROUND_H);
   ctx.fillStyle=PAL.ground; ctx.fillRect(0,H-gh,W,gh);
   ctx.fillStyle=PAL.groundTop; ctx.fillRect(0,H-gh,W,S(5));
-  for(let x=(frame*spd*0.5)%S(40);x<W;x+=S(40)){
+  for(let x=groundScroll; x<W; x+=S(40)){
     ctx.fillStyle='#20203a'; ctx.fillRect(x,H-gh+S(9),S(18),S(3));
   }
 }
@@ -720,7 +727,7 @@ function drawSeafoodItem(c, magnifyScale) {
 function drawCollectibles() {
   const msc=magnifyActive?3:1;
   for(const c of collectibles){
-    c.pulse=(c.pulse||0)+0.08;
+    c.pulse=(c.pulse||0)+0.08*dt;
     if(c.type==='heart'){
       drawHeart(c.x,c.y,S(10)*msc*(1+0.1*Math.sin(c.pulse)),0.92);
     } else if(c.type==='shield'){
@@ -824,7 +831,7 @@ function drawHUD() {
     ctx.fillText(popup.text,popup.x+S(1),popup.y-rise+S(1));
     ctx.fillStyle=popup.color;
     ctx.fillText(popup.text,popup.x,popup.y-rise);
-    ctx.restore(); popup.timer--;
+    ctx.restore(); popup.timer -= dt;
   }
 }
 
@@ -992,7 +999,7 @@ function drawOverlay() {
 // ── Update ─────────────────────────────────────────────────────────────────────
 function update() {
   if(state==='countdown'){
-    countdownFrames--;
+    countdownFrames -= dt;
     if(countdownFrames<=0){
       countdownVal--;
       if(countdownVal<0){ state='playing'; showPauseBtn(true); }
@@ -1014,27 +1021,27 @@ function update() {
     cat.vy=0; cat.angle=0;
     const goUp  =keys['ArrowUp']  ||(touchCanvasY!==null&&touchCanvasY<cat.y-S(8));
     const goDown=keys['ArrowDown']||(touchCanvasY!==null&&touchCanvasY>cat.y+S(8));
-    if(goUp)   cat.y=Math.max(cat.y-WINGS_SPEED,S(16));
-    if(goDown) cat.y=Math.min(cat.y+WINGS_SPEED,H-S(GROUND_H)-S(16));
-    wingsTimer--;
+    if(goUp)   cat.y=Math.max(cat.y-WINGS_SPEED*dt, S(16));
+    if(goDown) cat.y=Math.min(cat.y+WINGS_SPEED*dt, H-S(GROUND_H)-S(16));
+    wingsTimer -= dt;
     if(wingsTimer<=0){ wingsActive=false; wingsTimer=0; }
   } else {
-    cat.vy+=g; cat.y+=cat.vy;
+    cat.vy += g*dt; cat.y += cat.vy*dt;
     cat.angle=Math.min(Math.max(cat.vy*0.06,-0.5),1.1);
-    if(cat.invincible>0) cat.invincible--;
+    if(cat.invincible>0) cat.invincible -= dt;
   }
 
   const targetMult=1+Math.floor(score/10)*0.08;
-  speedMult+=(targetMult-speedMult)*0.015;
+  speedMult += (targetMult-speedMult)*0.015*dt;
 
-  if(shieldActive){ shieldTimer--; if(shieldTimer<=0){ shieldActive=false; shieldTimer=0; } }
-  if(seafoodDoubler){ seafoodDoublerTimer--; if(seafoodDoublerTimer<=0){ seafoodDoubler=false; } }
-  if(slowmo){ slowmoTimer--; if(slowmoTimer<=0){ slowmo=false; slowmoTimer=0; } }
-  if(magnetActive){ magnetTimer--; if(magnetTimer<=0){ magnetActive=false; magnetTimer=0; } }
-  if(magnifyActive){ magnifyTimer--; if(magnifyTimer<=0){ magnifyActive=false; magnifyTimer=0; } }
+  if(shieldActive){ shieldTimer -= dt; if(shieldTimer<=0){ shieldActive=false; shieldTimer=0; } }
+  if(seafoodDoubler){ seafoodDoublerTimer -= dt; if(seafoodDoublerTimer<=0){ seafoodDoubler=false; } }
+  if(slowmo){ slowmoTimer -= dt; if(slowmoTimer<=0){ slowmo=false; slowmoTimer=0; } }
+  if(magnetActive){ magnetTimer -= dt; if(magnetTimer<=0){ magnetActive=false; magnetTimer=0; } }
+  if(magnifyActive){ magnifyTimer -= dt; if(magnifyTimer<=0){ magnifyActive=false; magnifyTimer=0; } }
 
   // ── Pipe spawn ───────────────────────────────────────────────────────────
-  nextPipeIn--;
+  nextPipeIn -= dt;
   if(nextPipeIn<=0){
     const gh=S(GROUND_H);
 
@@ -1105,18 +1112,19 @@ function update() {
   }
 
   // ── Move world ───────────────────────────────────────────────────────────
+  groundScroll = (groundScroll + spd*dt*0.5) % S(40);
   pipes.forEach(p=>{
-    p.x-=spd;
+    p.x -= spd*dt;
     // Drift
     if(p.drift!==0){
-      p.topH+=p.drift*worldSlow;
+      p.topH += p.drift*worldSlow*dt;
       const effGap=getEffectiveGap(p);
       const minT=S(60), maxT=H-S(GROUND_H)-effGap-S(60);
       if(p.topH<=minT||p.topH>=maxT) p.drift*=-1;
       p.topH=Math.max(minT,Math.min(p.topH,maxT));
     }
     // Gap oscillation
-    if(p.gapOscillate) p.gapPhase+=0.025;
+    if(p.gapOscillate) p.gapPhase += 0.025*dt;
     // Track minimum clearance while Moo is overlapping this pipe in x
     if(!p.scored&&!cat.dead){
       const pw=S(PIPE_W),r=S(8);
@@ -1129,7 +1137,7 @@ function update() {
     }
   });
   pipes=pipes.filter(p=>p.x+S(PIPE_W)>-10);
-  collectibles.forEach(c=>c.x-=spd);
+  collectibles.forEach(c=>c.x -= spd*dt);
   collectibles=collectibles.filter(c=>c.x+S(20)>-10);
 
   // ── Magnet ───────────────────────────────────────────────────────────────
@@ -1137,14 +1145,14 @@ function update() {
     collectibles.forEach(c=>{
       const dx=cat.x-c.x, dy=cat.y-c.y;
       const dist=Math.sqrt(dx*dx+dy*dy);
-      if(dist>S(5)){ const pull=Math.min(6,dist*0.06+1); c.x+=(dx/dist)*pull; c.y+=(dy/dist)*pull; }
+      if(dist>S(5)){ const pull=Math.min(6,dist*0.06+1)*dt; c.x+=(dx/dist)*pull; c.y+=(dy/dist)*pull; }
     });
   }
 
   // ── Particles update ─────────────────────────────────────────────────────
-  nearMissSparks.forEach(s=>{s.x+=s.vx; s.y+=s.vy; s.vy+=0.08; s.life--;});
+  nearMissSparks.forEach(s=>{s.x+=s.vx*dt; s.y+=s.vy*dt; s.vy+=0.08*dt; s.life-=dt;});
   nearMissSparks=nearMissSparks.filter(s=>s.life>0);
-  shatterParticles.forEach(s=>{s.x+=s.vx; s.y+=s.vy; s.vy+=0.12; s.life--;});
+  shatterParticles.forEach(s=>{s.x+=s.vx*dt; s.y+=s.vy*dt; s.vy+=0.12*dt; s.life-=dt;});
   shatterParticles=shatterParticles.filter(s=>s.life>0);
 
   // ── Score ─────────────────────────────────────────────────────────────────
@@ -1246,14 +1254,14 @@ function update() {
     }
   }
 
-  if(hitFlashTimer>0) hitFlashTimer--;
+  if(hitFlashTimer>0) hitFlashTimer -= dt;
 }
 
 // ── Render ─────────────────────────────────────────────────────────────────────
 function render(){
   if(flashTimer>0){
     ctx.fillStyle=PAL.flash; ctx.globalAlpha=flashTimer/8*0.4;
-    ctx.fillRect(0,0,W,H); ctx.globalAlpha=1; flashTimer--; return;
+    ctx.fillRect(0,0,W,H); ctx.globalAlpha=1; flashTimer -= dt; return;
   }
 
   drawBackground();
@@ -1303,7 +1311,14 @@ document.addEventListener('keydown', e => {
   if(e.code==='KeyP'&&(state==='playing'||state==='paused')) togglePause();
 });
 
-function loop(){ update(); render(); requestAnimationFrame(loop); }
+function loop(timestamp) {
+  // Compute delta time, normalised so dt=1.0 at 60 fps.
+  // Cap at 3× (50 ms) to prevent a huge jump if the tab was backgrounded.
+  const elapsed = lastTime !== null ? timestamp - lastTime : 1000/60;
+  lastTime = timestamp;
+  dt = Math.min(elapsed / (1000/60), 3);
+  update(); render(); requestAnimationFrame(loop);
+}
 resetGame();
 loop();
 </script>
